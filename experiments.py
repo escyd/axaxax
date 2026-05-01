@@ -1,0 +1,314 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+
+
+from AgentBasedModel.agents.multi_market import AssetMarket, FXMarket
+from AgentBasedModel.agents.factory import build_multi_traders
+from AgentBasedModel.events.multi_events import MultiMarketPriceShock
+from AgentBasedModel.simulator.multi_simulator import MultiMarketSimulator
+
+OUT_DIR = "tables/"
+
+
+def clear_tables():
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+
+    for f in os.listdir(OUT_DIR):
+        path = os.path.join(OUT_DIR, f)
+        if os.path.isfile(path) and f.endswith(".csv"):
+            os.remove(path)
+
+
+def set_all_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def build_system(
+    tau=0.0,
+    beta=0.0,
+    fx_cost=0.001,
+    shock_iteration=200,
+    n_a_only_random=15,
+    n_b_only_random=15,
+    n_cross_random=10,
+    n_a_only_fundamental=8,
+    n_b_only_fundamental=8,
+    n_cross_fundamental=10,
+    n_fx_traders=8,
+):
+    market_a = AssetMarket(
+        name="A",
+        asset_name="ASSET_X",
+        base_currency="CUR_A",
+        price=100.0,
+        std=10.0,
+        volume=1000,
+        transaction_cost=0.001,
+        position=(2, 10),
+    )
+
+    market_b = AssetMarket(
+        name="B",
+        asset_name="ASSET_X",
+        base_currency="CUR_B",
+        price=102.0,
+        std=10.0,
+        volume=1000,
+        transaction_cost=0.001,
+        position=(18, 10),
+    )
+
+    fx_market = FXMarket(
+        name="FX",
+        base_currency="CUR_A",
+        quote_currency="CUR_B",
+        price=1.0,
+        std=0.03,
+        volume=500,
+        transaction_cost=fx_cost,
+        position=(10, 10),
+    )
+
+    markets = {
+        "A": market_a,
+        "B": market_b,
+    }
+
+    traders = build_multi_traders(
+        markets=markets,
+        fx_market=fx_market,
+        grid_size=(20, 20),
+        n_a_only_random=n_a_only_random,
+        n_b_only_random=n_b_only_random,
+        n_cross_random=n_cross_random,
+        n_a_only_fundamental=n_a_only_fundamental,
+        n_b_only_fundamental=n_b_only_fundamental,
+        n_cross_fundamental=n_cross_fundamental,
+        n_fx_traders=n_fx_traders,
+    )
+
+    events = [
+        MultiMarketPriceShock(
+            market_name="A",
+            iteration=shock_iteration,
+            delta_price=-10.0,
+            spillover_beta=beta,
+        )
+    ]
+
+    simulator = MultiMarketSimulator(
+        markets=markets,
+        fx_market=fx_market,
+        traders=traders,
+        events=events,
+        tau=tau,
+        beta_link=beta,
+        link_strength=0.05,
+    )
+
+    return simulator
+
+
+def compute_recovery_time_relative(price_gap, shock_iteration, baseline_window=50, epsilon=0.5):
+    left = price_gap[max(0, shock_iteration - baseline_window):shock_iteration]
+
+    if len(left) == 0:
+        return np.nan
+
+    baseline = sum(left) / len(left)
+    threshold = baseline + epsilon
+
+    for t in range(shock_iteration, len(price_gap)):
+        if price_gap[t] <= threshold:
+            return t - shock_iteration
+
+    return np.nan
+
+
+def second_market_recovery_time(prices_b, shock_iteration, window_before=20, eps=1.0):
+    left = prices_b[max(0, shock_iteration - window_before):shock_iteration]
+
+    if len(left) == 0:
+        return None
+
+    baseline = sum(left) / len(left)
+
+    for t in range(shock_iteration + 1, len(prices_b)):
+        if abs(prices_b[t] - baseline) <= eps:
+            return t - shock_iteration
+
+    return None
+
+def summarize_run(simulator, tau, beta, run_id, fx_cost, shock_iteration=200, window=50, ):
+    prices_a = simulator.info.prices_a
+    prices_b = simulator.info.prices_b
+    fx_rates = simulator.info.fx_rates
+    gap = simulator.info.price_gap
+
+    left_gap = gap[max(0, shock_iteration - window):shock_iteration]
+    right_gap = gap[shock_iteration:shock_iteration + window]
+
+    vol = simulator.volatility_before_after(shock_iteration=shock_iteration, window=window)
+
+    recovery = compute_recovery_time_relative(
+        price_gap=gap,
+        shock_iteration=shock_iteration,
+        baseline_window=window,
+        epsilon=0.5,
+    )
+    recovery_b = second_market_recovery_time(
+        prices_b=simulator.info.prices_b,
+        shock_iteration=shock_iteration,
+        window_before=20,
+        eps=1.0,
+    )
+
+    return {
+        "run_id": run_id,
+        "tau": tau,
+        "beta": beta,
+        "shock_iteration": shock_iteration,
+        "avg_gap_before": float(np.mean(left_gap)) if len(left_gap) > 0 else np.nan,
+        "avg_gap_after": float(np.mean(right_gap)) if len(right_gap) > 0 else np.nan,
+        "max_gap_after": float(np.max(right_gap)) if len(right_gap) > 0 else np.nan,
+        "recovery_time": recovery,
+        "vol_before": vol["before"],
+        "vol_after": vol["after"],
+        "final_price_a": prices_a[-1] if len(prices_a) > 0 else np.nan,
+        "final_price_b": prices_b[-1] if len(prices_b) > 0 else np.nan,
+        "final_fx": fx_rates[-1] if len(fx_rates) > 0 else np.nan,
+        "final_gap": gap[-1] if len(gap) > 0 else np.nan,
+        "fx_cost": fx_cost,
+        "recovery_b": recovery_b,
+    }
+
+
+def save_timeseries(simulator, tau, beta, run_id):
+    df = pd.DataFrame({
+        "price_a": simulator.info.prices_a,
+        "price_b": simulator.info.prices_b,
+        "fx": simulator.info.fx_rates,
+        "gap": simulator.info.price_gap,
+        "volume_a": simulator.info.traded_volume_a,
+        "volume_b": simulator.info.traded_volume_b,
+        "volume_fx": simulator.info.fx_volume,
+    })
+
+    name = f"timeseries_tau_{tau}_beta_{beta}_run_{run_id}.csv"
+    df.to_csv(OUT_DIR + name, index=False)
+
+
+def aggregate_results(raw_df):
+    grouped = raw_df.groupby(["tau", "beta", "fx_cost"], dropna=False)
+
+    summary_df = grouped.agg(
+        n_runs=("run_id", "count"),
+        avg_gap_before_mean=("avg_gap_before", "mean"),
+        avg_gap_before_std=("avg_gap_before", "std"),
+        avg_gap_after_mean=("avg_gap_after", "mean"),
+        avg_gap_after_std=("avg_gap_after", "std"),
+        max_gap_after_mean=("max_gap_after", "mean"),
+        max_gap_after_std=("max_gap_after", "std"),
+        recovery_time_mean=("recovery_time", "mean"),
+        recovery_time_std=("recovery_time", "std"),
+        vol_before_mean=("vol_before", "mean"),
+        vol_before_std=("vol_before", "std"),
+        vol_after_mean=("vol_after", "mean"),
+        vol_after_std=("vol_after", "std"),
+        final_gap_mean=("final_gap", "mean"),
+        final_gap_std=("final_gap", "std"),
+        recovery_b_mean=("recovery_b", "mean"),
+        recovery_b_std=("recovery_b", "std"),
+    ).reset_index()
+
+    return summary_df
+
+
+
+def run_experiments(
+    tau_values,
+    beta_values,
+    n_runs=20,
+    steps=500,
+    shock_iteration=200,
+    save_full_timeseries=False,
+):
+    raw_rows = []
+
+    fx_cost_values = [0.0, 0.001, 0.003, 0.005, 0.01]
+    for fx_cost in fx_cost_values:
+        for tau in tau_values:
+            for beta in beta_values:
+                print()
+                print(f"Scenario: tau={tau}, beta={beta}, fx_cost={fx_cost}")
+
+                for run_id in range(n_runs):
+                    seed = 42 + run_id
+                    set_all_seeds(seed)
+
+                    print(f"  run {run_id + 1}/{n_runs} (seed={seed})")
+
+                    simulator = build_system(
+                        tau=tau,
+                        beta=beta,
+                        shock_iteration=shock_iteration,
+                        fx_cost=fx_cost,
+                    )
+
+                    simulator.simulate(steps)
+
+                    row = summarize_run(
+                        simulator=simulator,
+                        tau=tau,
+                        beta=beta,
+                        run_id=run_id,
+                        shock_iteration=shock_iteration,
+                        window=50,
+                        fx_cost=fx_cost,
+
+                    )
+
+                    raw_rows.append(row)
+
+
+                if save_full_timeseries:
+                    save_timeseries(simulator, tau, beta, run_id)
+
+    raw_df = pd.DataFrame(raw_rows)
+    raw_df.to_csv(OUT_DIR + "raw_results.csv", index=False)
+
+    summary_df = aggregate_results(raw_df)
+    summary_df.to_csv(OUT_DIR + "summary_results.csv", index=False)
+
+    return raw_df, summary_df
+
+
+def main():
+    clear_tables()
+
+    tau_values = [0.0, 0.1, 0.3, 0.5, 1.0]
+    beta_values = [0.0, 0.2, 0.4, 0.6]
+
+    raw_df, summary_df = run_experiments(
+        tau_values=tau_values,
+        beta_values=beta_values,
+        n_runs=20,
+        steps=500,
+        shock_iteration=200,
+        save_full_timeseries=False,
+    )
+
+    print()
+    print("=== RAW RESULTS (first rows) ===")
+    print(raw_df.head())
+
+    print()
+    print("=== SUMMARY RESULTS ===")
+    print(summary_df)
+
+
+main()
