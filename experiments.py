@@ -310,5 +310,6 @@ def main():
     print("=== SUMMARY RESULTS ===")
     print(summary_df)
 
+if __name__ == "__main__":
+    run_robustness_checks()
 
-main()
